@@ -1,0 +1,595 @@
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 94a753fcb..7366b6740 100644
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -181,6 +181,9 @@ config INPUT_E3X0_BUTTON
+ config INPUT_PCSPKR
+ 	tristate "PC Speaker support"
+ 	depends on PCSPKR_PLATFORM
++	# square-wave harmonics extend above the hardening pass-band and
++	# cannot be filtered in software; the two are mutually exclusive
++	depends on !SND_NATIONSTATE_FILTER
+ 	help
+ 	  Say Y here if you want the standard PC Speaker to be used for
+ 	  bells and whistles.
+diff --git a/include/sound/acoustic_filter.h b/include/sound/acoustic_filter.h
+new file mode 100644
+index 000000000..5619a7b33
+--- /dev/null
++++ b/include/sound/acoustic_filter.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Acoustic band-pass hardening filter ("Nationstate level filter pass").
++ *
++ * Enforces a fixed audio pass-band (CONFIG_SND_NATIONSTATE_FILTER_LOW_HZ ..
++ * CONFIG_SND_NATIONSTATE_FILTER_HIGH_HZ) on every PCM stream that flows
++ * through the ALSA core.  Because PulseAudio, PipeWire and JACK all sit on
++ * top of the ALSA kernel PCM layer, filtering here covers all of them; the
++ * pass-band cannot be reconfigured or bypassed from user space.
++ *
++ * The threat model is acoustic covert/side channels (ultrasonic beacons,
++ * near-ultrasonic exfiltration, infrasonic side channels).  This is a DSP
++ * band-pass: it *does* run code on the sample stream.  There is no way to
++ * remove out-of-band energy from a digital stream without processing it.
++ */
++#ifndef __SOUND_ACOUSTIC_FILTER_H
++#define __SOUND_ACOUSTIC_FILTER_H
++
++struct snd_pcm_substream;
++struct snd_pcm_runtime;
++
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++
++/**
++ * snd_acoustic_filter_apply - band-pass a chunk of PCM data in place
++ * @substream: the PCM substream the data belongs to
++ * @channel:   channel index for non-interleaved access; ignored (0) for
++ *             interleaved access where @data holds all channels
++ * @data:      pointer into the DMA buffer holding the samples to filter
++ * @bytes:     number of bytes at @data to process
++ *
++ * Called from the PCM copy path for both playback (after the data has been
++ * copied into the DMA buffer) and capture (before the data is handed to user
++ * space).  Filtering is done in place.  Unsupported sample formats are passed
++ * through unmodified.  Returns 0 on success or a negative errno on allocation
++ * failure.
++ */
++int snd_acoustic_filter_apply(struct snd_pcm_substream *substream, int channel,
++			      void *data, unsigned long bytes);
++
++/* release per-substream filter state; called from snd_pcm_detach_substream() */
++void snd_acoustic_filter_free(struct snd_pcm_runtime *runtime);
++
++#else /* !CONFIG_SND_NATIONSTATE_FILTER */
++
++static inline int snd_acoustic_filter_apply(struct snd_pcm_substream *substream,
++					    int channel, void *data,
++					    unsigned long bytes)
++{
++	return 0;
++}
++
++static inline void snd_acoustic_filter_free(struct snd_pcm_runtime *runtime)
++{
++}
++
++#endif /* CONFIG_SND_NATIONSTATE_FILTER */
++
++#endif /* __SOUND_ACOUSTIC_FILTER_H */
+diff --git a/include/sound/pcm.h b/include/sound/pcm.h
+index 76fc33dce..6fa459f9c 100644
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -441,6 +441,10 @@ struct snd_pcm_runtime {
+ 	struct snd_dma_buffer *dma_buffer_p;	/* allocated buffer */
+ 	unsigned int buffer_changed:1;	/* buffer allocation changed; set only in managed mode */
+ 
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++	void *acoustic_filter;		/* band-pass hardening filter state */
++#endif
++
+ 	/* -- audio timestamp config -- */
+ 	struct snd_pcm_audio_tstamp_config audio_tstamp_config;
+ 	struct snd_pcm_audio_tstamp_report audio_tstamp_report;
+diff --git a/sound/core/Kconfig b/sound/core/Kconfig
+index 4e7bc370f..02153bce5 100644
+--- a/sound/core/Kconfig
++++ b/sound/core/Kconfig
+@@ -255,6 +255,52 @@ config SND_UTIMER
+ 	  sound timing with userspace applications (for instance, when sending
+ 	  data through snd-aloop).
+ 
++config SND_NATIONSTATE_FILTER
++	bool "Nationstate level filter pass (acoustic band-pass hardening)"
++	depends on SND_PCM
++	# SND_PCSP "select"s SND_PCM, so the pcspkr exclusion is expressed
++	# here rather than on SND_PCSP to avoid a recursive Kconfig dependency.
++	depends on SND_PCSP=n
++	help
++	  Enforce a fixed audio pass-band on every PCM stream that flows
++	  through the ALSA core.  All frequencies outside the configured band
++	  are attenuated by a band-pass filter (a high-pass at the lower cutoff
++	  cascaded with a low-pass at the upper cutoff) applied to both
++	  playback and capture.
++
++	  Because PulseAudio, PipeWire and JACK all run on top of the ALSA
++	  kernel PCM layer, the filter covers all of them, and the pass-band
++	  cannot be reconfigured or bypassed from user space.  To keep it
++	  unbypassable, mmap access to PCM devices is disabled while this
++	  option is set, forcing all clients through the filtered read/write
++	  path; devices that only support mmap access will fail to open.
++
++	  This is intended as hardening against acoustic covert and side
++	  channels (ultrasonic beacons, near-ultrasonic exfiltration,
++	  infrasonic side channels).  It is a DSP filter: it processes the
++	  sample stream and adds CPU cost on the audio path.
++
++	  Enabling this disables the PC speaker drivers (INPUT_PCSPKR and
++	  SND_PCSP), whose square-wave output has harmonics above the band
++	  that software cannot remove.
++
++	  If unsure, say N.
++
++config SND_NATIONSTATE_FILTER_LOW_HZ
++	int "Lower cutoff frequency (Hz)"
++	depends on SND_NATIONSTATE_FILTER
++	default 16
++	help
++	  Frequencies below this are attenuated (high-pass cutoff).
++
++config SND_NATIONSTATE_FILTER_HIGH_HZ
++	int "Upper cutoff frequency (Hz)"
++	depends on SND_NATIONSTATE_FILTER
++	default 10000
++	help
++	  Frequencies above this are attenuated (low-pass cutoff).  The value
++	  is clamped below the Nyquist frequency of each stream's sample rate.
++
+ config SND_VMASTER
+ 	bool
+ 
+diff --git a/sound/core/Makefile b/sound/core/Makefile
+index fdd3bb6e8..ea6911a7a 100644
+--- a/sound/core/Makefile
++++ b/sound/core/Makefile
+@@ -16,6 +16,7 @@ snd-$(CONFIG_SND_JACK)	  += ctljack.o jack.o
+ 
+ snd-pcm-y := pcm.o pcm_native.o pcm_lib.o pcm_misc.o \
+ 		pcm_memory.o memalloc.o
++snd-pcm-$(CONFIG_SND_NATIONSTATE_FILTER) += acoustic_filter.o
+ snd-pcm-$(CONFIG_SND_PCM_TIMER) += pcm_timer.o
+ snd-pcm-$(CONFIG_SND_PCM_ELD) += pcm_drm_eld.o
+ snd-pcm-$(CONFIG_SND_PCM_IEC958) += pcm_iec958.o
+diff --git a/sound/core/acoustic_filter.c b/sound/core/acoustic_filter.c
+new file mode 100644
+index 000000000..d3cb93401
+--- /dev/null
++++ b/sound/core/acoustic_filter.c
+@@ -0,0 +1,293 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Acoustic band-pass hardening filter ("Nationstate level filter pass").
++ *
++ * Applies a fixed band-pass (CONFIG_SND_NATIONSTATE_FILTER_LOW_HZ ..
++ * CONFIG_SND_NATIONSTATE_FILTER_HIGH_HZ) to every PCM stream passing through
++ * the ALSA core.  Implemented as a cascade of two RBJ biquads per channel:
++ * a 2nd-order Butterworth high-pass at the low cutoff followed by a 2nd-order
++ * Butterworth low-pass at the high cutoff.
++ *
++ * Everything is fixed point: the kernel must not use the FPU on the audio
++ * path, and biquad coefficients need sin()/cos(), so a small Bhaskara-I
++ * sine approximation is used to derive the coefficients at hw_params time.
++ *
++ * Supported sample formats are the little-endian signed integer formats real
++ * hardware uses (S16_LE and 32-bit containers: S32_LE, S24_LE).  Anything
++ * else is passed through untouched.
++ */
++#include <linux/slab.h>
++#include <linux/math64.h>
++#include <linux/minmax.h>
++#include <linux/unaligned.h>
++#include <linux/overflow.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/acoustic_filter.h>
++
++/* coefficient / sample-math fixed-point format */
++#define FILT_FRAC	27
++#define FILT_ONE	(1LL << FILT_FRAC)
++#define FILT_ROUND	(1LL << (FILT_FRAC - 1))
++
++/* 1/(2Q) for a Butterworth section, Q = 1/sqrt(2), in Q30 */
++#define INV_2Q_Q30	759250125LL	/* round(0.70710678 * 2^30) */
++
++/* pi family in Q16 */
++#define PI_Q16		205887LL
++#define HALFPI_Q16	102944LL
++#define TWOPI_Q16	411775LL
++
++/* 1.0 in Q30, used while designing coefficients before normalization */
++#define Q30_ONE		(1LL << 30)
++
++struct biquad_state {
++	s32 x1, x2;	/* previous inputs  */
++	s32 y1, y2;	/* previous outputs */
++};
++
++struct acoustic_chan {
++	struct biquad_state hp;	/* high-pass at the low cutoff  */
++	struct biquad_state lp;	/* low-pass at the high cutoff  */
++};
++
++struct acoustic_filter {
++	unsigned int rate;
++	unsigned int channels;
++
++	/* normalized coefficients (Q27); shared by all channels */
++	s64 hp_b0, hp_b1, hp_b2, hp_a1, hp_a2;
++	s64 lp_b0, lp_b1, lp_b2, lp_a1, lp_a2;
++
++	struct acoustic_chan chan[];	/* [channels] */
++};
++
++/*
++ * Bhaskara I sine approximation, accurate to ~0.2%.  @angle is in Q16
++ * radians; the result is in Q30 over [-1, 1].  Good enough for filter
++ * coefficient design and needs no table or FPU.
++ */
++static s64 fp_sin(s64 angle)
++{
++	s64 five_pisq, x, t, num, den, res;
++	int neg = 0;
++
++	/* reduce to [0, 2pi) */
++	angle %= TWOPI_Q16;
++	if (angle < 0)
++		angle += TWOPI_Q16;
++
++	/* sin(x + pi) = -sin(x): fold to [0, pi] */
++	if (angle > PI_Q16) {
++		angle -= PI_Q16;
++		neg = 1;
++	}
++	x = angle;
++
++	t = (x * (PI_Q16 - x)) >> 16;			/* Q16 */
++	five_pisq = 5 * ((PI_Q16 * PI_Q16) >> 16);	/* Q16 */
++
++	num = 16 * t;					/* Q16 */
++	den = five_pisq - 4 * t;			/* Q16 */
++	if (den <= 0)
++		return 0;
++
++	res = div_s64(num << 30, den);			/* Q30 */
++	return neg ? -res : res;
++}
++
++static s64 fp_cos(s64 angle)
++{
++	return fp_sin(angle + HALFPI_Q16);
++}
++
++/* normalize a Q30 coefficient by a0 (Q30), result in Q27 */
++static s64 norm_coeff(s64 coeff_q30, s64 a0_q30)
++{
++	return div_s64(coeff_q30 << FILT_FRAC, a0_q30);
++}
++
++static void design_filter(struct acoustic_filter *f, unsigned int rate)
++{
++	s64 w0_lo, w0_hi, cos0, sin0, alpha, a0;
++	s64 b0, b1, b2;
++	unsigned int low = CONFIG_SND_NATIONSTATE_FILTER_LOW_HZ;
++	unsigned int high = CONFIG_SND_NATIONSTATE_FILTER_HIGH_HZ;
++
++	f->rate = rate;
++
++	/* clamp the high cutoff below Nyquist so the design stays valid */
++	if (high > rate / 2)
++		high = rate / 2;
++
++	/* w0 = 2*pi*fc/fs, in Q16 radians; index needs no pi: 2pi*fc/fs */
++	w0_lo = div_u64(TWOPI_Q16 * low, rate);
++	w0_hi = div_u64(TWOPI_Q16 * high, rate);
++
++	/* ---- high-pass at the low cutoff ---- */
++	sin0 = fp_sin(w0_lo);
++	cos0 = fp_cos(w0_lo);
++	alpha = (sin0 * INV_2Q_Q30) >> 30;		/* Q30 */
++	a0 = Q30_ONE + alpha;				/* Q30 */
++	b0 = Q30_ONE + cos0;				/* (1 + cos)  Q30 */
++	f->hp_b0 = norm_coeff(b0 / 2, a0);
++	f->hp_b1 = norm_coeff(-b0, a0);
++	f->hp_b2 = norm_coeff(b0 / 2, a0);
++	f->hp_a1 = norm_coeff(-2 * cos0, a0);
++	f->hp_a2 = norm_coeff(Q30_ONE - alpha, a0);
++
++	/* ---- low-pass at the high cutoff ---- */
++	sin0 = fp_sin(w0_hi);
++	cos0 = fp_cos(w0_hi);
++	alpha = (sin0 * INV_2Q_Q30) >> 30;		/* Q30 */
++	a0 = Q30_ONE + alpha;				/* Q30 */
++	b1 = Q30_ONE - cos0;				/* (1 - cos)  Q30 */
++	b0 = b1 / 2;
++	b2 = b1 / 2;
++	f->lp_b0 = norm_coeff(b0, a0);
++	f->lp_b1 = norm_coeff(b1, a0);
++	f->lp_b2 = norm_coeff(b2, a0);
++	f->lp_a1 = norm_coeff(-2 * cos0, a0);
++	f->lp_a2 = norm_coeff(Q30_ONE - alpha, a0);
++}
++
++/* run one biquad on one integer sample; coefficients are Q27 */
++static s32 biquad_step(struct biquad_state *s, s32 in,
++		       s64 b0, s64 b1, s64 b2, s64 a1, s64 a2,
++		       s32 smin, s32 smax)
++{
++	s64 acc;
++	s32 out;
++
++	acc = b0 * in + b1 * s->x1 + b2 * s->x2 - a1 * s->y1 - a2 * s->y2;
++	acc = (acc + FILT_ROUND) >> FILT_FRAC;
++	out = clamp_t(s64, acc, smin, smax);
++
++	s->x2 = s->x1;
++	s->x1 = in;
++	s->y2 = s->y1;
++	s->y1 = out;
++	return out;
++}
++
++static s32 filter_sample(struct acoustic_filter *f, struct acoustic_chan *c,
++			 s32 in, s32 smin, s32 smax)
++{
++	s32 v;
++
++	v = biquad_step(&c->hp, in, f->hp_b0, f->hp_b1, f->hp_b2,
++			f->hp_a1, f->hp_a2, smin, smax);
++	v = biquad_step(&c->lp, v, f->lp_b0, f->lp_b1, f->lp_b2,
++			f->lp_a1, f->lp_a2, smin, smax);
++	return v;
++}
++
++/* fetch/store one little-endian sample of @bps bytes */
++static s32 load_sample(const u8 *p, int bps)
++{
++	if (bps == 2)
++		return (s16)get_unaligned_le16(p);
++	return (s32)get_unaligned_le32(p);
++}
++
++static void store_sample(u8 *p, int bps, s32 v)
++{
++	if (bps == 2)
++		put_unaligned_le16((u16)v, p);
++	else
++		put_unaligned_le32((u32)v, p);
++}
++
++static struct acoustic_filter *get_filter(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct acoustic_filter *f = runtime->acoustic_filter;
++	unsigned int channels = runtime->channels;
++
++	if (f && f->channels == channels) {
++		if (f->rate != runtime->rate)
++			design_filter(f, runtime->rate);
++		return f;
++	}
++
++	/* channel count changed (or first use): (re)allocate */
++	kfree(f);
++	f = kzalloc(struct_size(f, chan, channels), GFP_KERNEL);
++	if (!f) {
++		runtime->acoustic_filter = NULL;
++		return NULL;
++	}
++	f->channels = channels;
++	design_filter(f, runtime->rate);
++	runtime->acoustic_filter = f;
++	return f;
++}
++
++int snd_acoustic_filter_apply(struct snd_pcm_substream *substream, int channel,
++			      void *data, unsigned long bytes)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct acoustic_filter *f;
++	unsigned int channels = runtime->channels;
++	bool interleaved;
++	int width, bps, ch;
++	s32 smin, smax;
++	unsigned long n, i;
++	u8 *p = data;
++
++	if (!data || !bytes || !channels)
++		return 0;
++
++	/* only little-endian signed integer formats are filtered */
++	if (!snd_pcm_format_signed(runtime->format) ||
++	    !snd_pcm_format_little_endian(runtime->format))
++		return 0;
++
++	width = snd_pcm_format_width(runtime->format);
++	bps = snd_pcm_format_physical_width(runtime->format) / 8;
++	if (bps != 2 && bps != 4)
++		return 0;		/* e.g. packed S24_3LE: pass through */
++
++	/* sample value range for the logical width (S24_LE: 24-bit in 32) */
++	smax = (width >= 32) ? S32_MAX : ((1 << (width - 1)) - 1);
++	smin = (width >= 32) ? S32_MIN : -(1 << (width - 1));
++
++	f = get_filter(substream);
++	if (!f)
++		return -ENOMEM;
++
++	interleaved =
++		runtime->access == SNDRV_PCM_ACCESS_RW_INTERLEAVED ||
++		runtime->access == SNDRV_PCM_ACCESS_MMAP_INTERLEAVED;
++
++	if (interleaved) {
++		n = bytes / ((unsigned long)bps * channels);
++		for (i = 0; i < n; i++) {
++			for (ch = 0; ch < channels; ch++, p += bps) {
++				s32 v = load_sample(p, bps);
++
++				v = filter_sample(f, &f->chan[ch], v, smin, smax);
++				store_sample(p, bps, v);
++			}
++		}
++	} else {
++		/* one channel's contiguous samples */
++		if (channel < 0 || channel >= (int)channels)
++			return 0;
++		n = bytes / bps;
++		for (i = 0; i < n; i++, p += bps) {
++			s32 v = load_sample(p, bps);
++
++			v = filter_sample(f, &f->chan[channel], v, smin, smax);
++			store_sample(p, bps, v);
++		}
++	}
++
++	return 0;
++}
++
++void snd_acoustic_filter_free(struct snd_pcm_runtime *runtime)
++{
++	kfree(runtime->acoustic_filter);
++	runtime->acoustic_filter = NULL;
++}
+diff --git a/sound/core/pcm.c b/sound/core/pcm.c
+index bfedf571e..a7bf8e7ff 100644
+--- a/sound/core/pcm.c
++++ b/sound/core/pcm.c
+@@ -14,6 +14,7 @@
+ #include <sound/core.h>
+ #include <sound/minors.h>
+ #include <sound/pcm.h>
++#include <sound/acoustic_filter.h>
+ #include <sound/timer.h>
+ #include <sound/control.h>
+ #include <sound/info.h>
+@@ -986,6 +987,7 @@ void snd_pcm_detach_substream(struct snd_pcm_substream *substream)
+ 	runtime = substream->runtime;
+ 	if (runtime->private_free != NULL)
+ 		runtime->private_free(runtime);
++	snd_acoustic_filter_free(runtime);
+ 	free_pages_exact(runtime->status,
+ 		       PAGE_ALIGN(sizeof(struct snd_pcm_mmap_status)));
+ 	free_pages_exact(runtime->control,
+diff --git a/sound/core/pcm_lib.c b/sound/core/pcm_lib.c
+index fe597f7d5..300014ce7 100644
+--- a/sound/core/pcm_lib.c
++++ b/sound/core/pcm_lib.c
+@@ -15,6 +15,7 @@
+ #include <sound/tlv.h>
+ #include <sound/info.h>
+ #include <sound/pcm.h>
++#include <sound/acoustic_filter.h>
+ #include <sound/pcm_params.h>
+ #include <sound/timer.h>
+ 
+@@ -2056,10 +2057,12 @@ static int default_write_copy(struct snd_pcm_substream *substream,
+ 			      int channel, unsigned long hwoff,
+ 			      struct iov_iter *iter, unsigned long bytes)
+ {
+-	if (copy_from_iter(get_dma_ptr(substream->runtime, channel, hwoff),
+-			   bytes, iter) != bytes)
++	void *dma = get_dma_ptr(substream->runtime, channel, hwoff);
++
++	if (copy_from_iter(dma, bytes, iter) != bytes)
+ 		return -EFAULT;
+-	return 0;
++	/* band-pass the data on its way to the hardware */
++	return snd_acoustic_filter_apply(substream, channel, dma, bytes);
+ }
+ 
+ /* fill silence instead of copy data; called as a transfer helper
+@@ -2089,8 +2092,14 @@ static int default_read_copy(struct snd_pcm_substream *substream,
+ 			     int channel, unsigned long hwoff,
+ 			     struct iov_iter *iter, unsigned long bytes)
+ {
+-	if (copy_to_iter(get_dma_ptr(substream->runtime, channel, hwoff),
+-			 bytes, iter) != bytes)
++	void *dma = get_dma_ptr(substream->runtime, channel, hwoff);
++	int err;
++
++	/* band-pass the captured data before user space can see it */
++	err = snd_acoustic_filter_apply(substream, channel, dma, bytes);
++	if (err < 0)
++		return err;
++	if (copy_to_iter(dma, bytes, iter) != bytes)
+ 		return -EFAULT;
+ 	return 0;
+ }
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 302643c1c..c4ab151a5 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -19,6 +19,7 @@
+ #include <sound/control.h>
+ #include <sound/info.h>
+ #include <sound/pcm.h>
++#include <sound/acoustic_filter.h>
+ #include <sound/pcm_params.h>
+ #include <sound/timer.h>
+ #include <sound/minors.h>
+@@ -537,6 +538,11 @@ static int fixup_unreferenced_params(struct snd_pcm_substream *substream,
+ 		if (!hw_support_mmap(substream))
+ 			params->info &= ~(SNDRV_PCM_INFO_MMAP |
+ 					  SNDRV_PCM_INFO_MMAP_VALID);
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++		/* never advertise mmap: force the filtered read/write path */
++		params->info &= ~(SNDRV_PCM_INFO_MMAP |
++				  SNDRV_PCM_INFO_MMAP_VALID);
++#endif
+ 	}
+ 
+ 	err = snd_pcm_ops_ioctl(substream,
+@@ -574,6 +580,27 @@ int snd_pcm_hw_refine(struct snd_pcm_substream *substream,
+ 	if (err < 0)
+ 		return err;
+ 
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++	/*
++	 * The acoustic band-pass hardening filter runs in the read/write copy
++	 * path.  mmap access lets user space (PulseAudio, PipeWire, JACK)
++	 * touch the DMA buffer directly and bypass it, so deny the mmap access
++	 * modes here: clients then fall back to read/write transfers and the
++	 * pass-band becomes unbypassable.  Devices that only support mmap
++	 * access will fail to open with this option enabled.
++	 */
++	{
++		struct snd_mask *amask =
++			hw_param_mask(params, SNDRV_PCM_HW_PARAM_ACCESS);
++
++		snd_mask_reset(amask, SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
++		snd_mask_reset(amask, SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED);
++		snd_mask_reset(amask, SNDRV_PCM_ACCESS_MMAP_COMPLEX);
++		if (snd_mask_empty(amask))
++			return -EINVAL;
++	}
++#endif
++
+ 	params->rmask = 0;
+ 
+ 	return 0;
+diff --git a/sound/drivers/Kconfig b/sound/drivers/Kconfig
+index 6debd8e95..39ee1f65f 100644
+--- a/sound/drivers/Kconfig
++++ b/sound/drivers/Kconfig
+@@ -50,6 +50,11 @@ config SND_PCSP
+ 	tristate "PC-Speaker support (READ HELP!)"
+ 	depends on PCSPKR_PLATFORM && X86 && HIGH_RES_TIMERS
+ 	depends on INPUT
++	# Mutually exclusive with the band-pass hardening filter (square-wave
++	# harmonics extend above the pass-band and cannot be filtered in
++	# software).  Because this driver "select"s SND_PCM, the exclusion is
++	# expressed on the filter side (SND_NATIONSTATE_FILTER depends on
++	# SND_PCSP=n) to avoid a Kconfig recursive dependency.
+ 	select SND_PCM
+ 	help
+ 	  If you don't have a sound card in your computer, you can include a
