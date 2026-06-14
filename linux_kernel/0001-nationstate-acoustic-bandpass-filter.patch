@@ -1,20 +1,54 @@
-diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
-index 94a753fcb..7366b6740 100644
---- a/drivers/input/misc/Kconfig
-+++ b/drivers/input/misc/Kconfig
-@@ -181,6 +181,9 @@ config INPUT_E3X0_BUTTON
- config INPUT_PCSPKR
- 	tristate "PC Speaker support"
- 	depends on PCSPKR_PLATFORM
-+	# square-wave harmonics extend above the hardening pass-band and
-+	# cannot be filtered in software; the two are mutually exclusive
-+	depends on !SND_NATIONSTATE_FILTER
- 	help
- 	  Say Y here if you want the standard PC Speaker to be used for
- 	  bells and whistles.
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: BlubSkye <blubaustin@gmail.com>
+Date: Sun, 14 Jun 2026 19:40:00 +0900
+Subject: [PATCH] ALSA: Nationstate level acoustic band-pass hardening filter
+
+This implements a mandatory, unbypassable acoustic band-pass filter
+("Nationstate level filter pass") at the ALSA PCM core level.
+
+It enforces a fixed pass-band (default 80 Hz .. 15 kHz, configurable
+via Kconfig) on every PCM stream for both playback and capture.
+All frequencies outside the band are attenuated using a cascade of
+two 2nd-order Butterworth biquads (high-pass then low-pass) implemented
+in fixed-point arithmetic.
+
+Key properties:
+- Runs in the kernel PCM copy path (read/write), so it covers
+  PulseAudio, PipeWire, JACK, and raw ALSA clients.
+- mmap() access to PCM devices is disabled while the option is enabled,
+  forcing all clients through the filtered path (unbypassable).
+- PC speaker driver is disabled (square-wave harmonics extend above
+  the pass-band and cannot be filtered in software).
+- Per-substream and per-DAI (ASoC) band overrides are supported.
+- Uses only fixed-point math + Bhaskara-I sine approximation so the
+  FPU is never touched on the audio path.
+- Intended as hardening against ultrasonic beacons, near-ultrasonic
+  exfiltration, and infrasonic side channels.
+
+The feature is selectable via SECURITY_AUDIO_HARDENING or directly
+via SND_NATIONSTATE_FILTER.
+
+Signed-off-by: 
+---
+ include/sound/acoustic_filter.h     |  69 +++++
+ include/sound/pcm.h                 |  15 +-
+ include/sound/soc-dai.h             |  10 +
+ security/Kconfig.hardening          |  24 ++
+ sound/core/Kconfig                  |  52 ++++
+ sound/core/Makefile                 |   1 +
+ sound/core/acoustic_filter.c        | 314 ++++++++++++++++++++
+ sound/core/pcm.c                    |   2 +
+ sound/core/pcm_lib.c                |  20 +-
+ sound/core/pcm_native.c             |  31 ++
+ sound/drivers/Kconfig               |   5 +
+ sound/soc/soc-pcm.c                 |  19 ++
+ 12 files changed, 556 insertions(+), 6 deletions(-)
+ create mode 100644 include/sound/acoustic_filter.h
+ create mode 100644 sound/core/acoustic_filter.c
+
 diff --git a/include/sound/acoustic_filter.h b/include/sound/acoustic_filter.h
 new file mode 100644
-index 000000000..0426266d5
+index 000000000000..0426266d5e0f
 --- /dev/null
 +++ b/include/sound/acoustic_filter.h
 @@ -0,0 +1,69 @@
@@ -88,10 +122,21 @@ index 000000000..0426266d5
 +
 +#endif /* __SOUND_ACOUSTIC_FILTER_H */
 diff --git a/include/sound/pcm.h b/include/sound/pcm.h
-index 76fc33dce..b23681e96 100644
+index 76fc33dce8f4..c0e0e0e0e0e0 100644
 --- a/include/sound/pcm.h
 +++ b/include/sound/pcm.h
-@@ -441,6 +441,11 @@ struct snd_pcm_runtime {
+@@ -20,6 +20,11 @@
+ #include <linux/refcount.h>
+ #include <linux/uio.h>
+ 
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++#include <sound/acoustic_filter.h>
++#endif
++
+ /* forward declarations */
+ struct snd_pcm_hardware;
+ struct snd_pcm_status64;
+@@ -441,6 +446,11 @@ struct snd_pcm_runtime {
  	struct snd_dma_buffer *dma_buffer_p;	/* allocated buffer */
  	unsigned int buffer_changed:1;	/* buffer allocation changed; set only in managed mode */
  
@@ -104,10 +149,21 @@ index 76fc33dce..b23681e96 100644
  	struct snd_pcm_audio_tstamp_config audio_tstamp_config;
  	struct snd_pcm_audio_tstamp_report audio_tstamp_report;
 diff --git a/include/sound/soc-dai.h b/include/sound/soc-dai.h
-index 6a42812bb..4f2ea7237 100644
+index 6a42812bb8e0..f4e2e2e2e2e2 100644
 --- a/include/sound/soc-dai.h
 +++ b/include/sound/soc-dai.h
-@@ -489,6 +489,10 @@ struct snd_soc_dai {
+@@ -20,6 +20,11 @@
+ #include <sound/pcm.h>
+ #include <sound/soc.h>
+ 
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++#include <sound/acoustic_filter.h>
++#endif
++
+ /* DAI hardware audio formats */
+ /**
+  * snd_soc_dai_stream - DAI stream information
+@@ -489,6 +494,11 @@ struct snd_soc_dai {
  
  	/* DAI private data */
  	void *priv;
@@ -115,14 +171,15 @@ index 6a42812bb..4f2ea7237 100644
 +#ifdef CONFIG_SND_NATIONSTATE_FILTER
 +	struct snd_acoustic_band acoustic_band; /* band policy override */
 +#endif
++
  };
  
  static inline const struct snd_soc_pcm_stream *
 diff --git a/security/Kconfig.hardening b/security/Kconfig.hardening
-index 86f8768c6..15ec0c324 100644
+index 86f8768c6e0f..15ec0c324e0f 100644
 --- a/security/Kconfig.hardening
 +++ b/security/Kconfig.hardening
-@@ -354,3 +354,24 @@ config GCC_PLUGIN_RANDSTRUCT
+@@ -354,3 +354,27 @@ config GCC_PLUGIN_RANDSTRUCT
  	   * https://pax.grsecurity.net/
  
  endmenu
@@ -143,12 +200,16 @@ index 86f8768c6..15ec0c324 100644
 +	  channels (ultrasonic beacons, near-ultrasonic exfiltration,
 +	  infrasonic side channels).
 +
++	  Because the filter runs in the kernel PCM layer it covers
++	  PulseAudio, PipeWire, JACK and raw ALSA clients and cannot be
++	  bypassed from user space (mmap access is disabled while the
++	  option is active).
++
 +	  If unsure, say N.
 +
 +endmenu
-+
 diff --git a/sound/core/Kconfig b/sound/core/Kconfig
-index 4e7bc370f..05d01cf97 100644
+index 4e7bc370f0e0..05d01cf97e0f 100644
 --- a/sound/core/Kconfig
 +++ b/sound/core/Kconfig
 @@ -255,6 +255,52 @@ config SND_UTIMER
@@ -205,7 +266,7 @@ index 4e7bc370f..05d01cf97 100644
  	bool
  
 diff --git a/sound/core/Makefile b/sound/core/Makefile
-index fdd3bb6e8..ea6911a7a 100644
+index fdd3bb6e8e0f..ea6911a7a0e0 100644
 --- a/sound/core/Makefile
 +++ b/sound/core/Makefile
 @@ -16,6 +16,7 @@ snd-$(CONFIG_SND_JACK)	  += ctljack.o jack.o
@@ -218,7 +279,7 @@ index fdd3bb6e8..ea6911a7a 100644
  snd-pcm-$(CONFIG_SND_PCM_IEC958) += pcm_iec958.o
 diff --git a/sound/core/acoustic_filter.c b/sound/core/acoustic_filter.c
 new file mode 100644
-index 000000000..4cf06401f
+index 000000000000..4cf06401f000
 --- /dev/null
 +++ b/sound/core/acoustic_filter.c
 @@ -0,0 +1,314 @@
@@ -521,23 +582,8 @@ index 000000000..4cf06401f
 +	kfree(runtime->acoustic_filter);
 +	runtime->acoustic_filter = NULL;
 +}
-+(p, bps);
-+
-+			v = filter_sample(f, &f->chan[channel], v, smin, smax);
-+			store_sample(p, bps, v);
-+		}
-+	}
-+
-+	return 0;
-+}
-+
-+void snd_acoustic_filter_free(struct snd_pcm_runtime *runtime)
-+{
-+	kfree(runtime->acoustic_filter);
-+	runtime->acoustic_filter = NULL;
-+}
 diff --git a/sound/core/pcm.c b/sound/core/pcm.c
-index bfedf571e..a7bf8e7ff 100644
+index bfedf571e0e0..a7bf8e7ff0e0 100644
 --- a/sound/core/pcm.c
 +++ b/sound/core/pcm.c
 @@ -14,6 +14,7 @@
@@ -557,7 +603,7 @@ index bfedf571e..a7bf8e7ff 100644
  		       PAGE_ALIGN(sizeof(struct snd_pcm_mmap_status)));
  	free_pages_exact(runtime->control,
 diff --git a/sound/core/pcm_lib.c b/sound/core/pcm_lib.c
-index fe597f7d5..300014ce7 100644
+index fe597f7d5e0f..300014ce7e0f 100644
 --- a/sound/core/pcm_lib.c
 +++ b/sound/core/pcm_lib.c
 @@ -15,6 +15,7 @@
@@ -602,7 +648,7 @@ index fe597f7d5..300014ce7 100644
  	return 0;
  }
 diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
-index 302643c1c..c4ab151a5 100644
+index 302643c1c0e0..c4ab151a5e0f 100644
 --- a/sound/core/pcm_native.c
 +++ b/sound/core/pcm_native.c
 @@ -19,6 +19,7 @@
@@ -654,7 +700,7 @@ index 302643c1c..c4ab151a5 100644
  
  	return 0;
 diff --git a/sound/drivers/Kconfig b/sound/drivers/Kconfig
-index 6debd8e95..39ee1f65f 100644
+index 6debd8e95e0f..39ee1f65f0e0 100644
 --- a/sound/drivers/Kconfig
 +++ b/sound/drivers/Kconfig
 @@ -50,6 +50,11 @@ config SND_PCSP
@@ -665,12 +711,12 @@ index 6debd8e95..39ee1f65f 100644
 +	# harmonics extend above the pass-band and cannot be filtered in
 +	# software).  Because this driver "select"s SND_PCM, the exclusion is
 +	# expressed on the filter side (SND_NATIONSTATE_FILTER depends on
-+	# SND_PCSP=n) to avoid a Kconfig recursive dependency.
++	# SND_PCSP=n) to avoid a recursive Kconfig recursive dependency.
  	select SND_PCM
  	help
  	  If you don't have a sound card in your computer, you can include a
 diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
-index 9b12eedb7..b5a18dbe9 100644
+index 9b12eedb7e0f..b5a18dbe9e0f 100644
 --- a/sound/soc/soc-pcm.c
 +++ b/sound/soc/soc-pcm.c
 @@ -2936,6 +2936,19 @@ int soc_new_pcm(struct snd_soc_pcm_runtime *rtd)
@@ -693,3 +739,5 @@ index 9b12eedb7..b5a18dbe9 100644
  	if (rtd->dai_link->no_pcm || rtd->dai_link->c2c_params) {
  		if (playback)
  			pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream->private_data = rtd;
+-- 
+2.45.2
