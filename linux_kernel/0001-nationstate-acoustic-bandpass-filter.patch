@@ -14,10 +14,10 @@ index 94a753fcb..7366b6740 100644
  	  bells and whistles.
 diff --git a/include/sound/acoustic_filter.h b/include/sound/acoustic_filter.h
 new file mode 100644
-index 000000000..5619a7b33
+index 000000000..0426266d5
 --- /dev/null
 +++ b/include/sound/acoustic_filter.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,69 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Acoustic band-pass hardening filter ("Nationstate level filter pass").
@@ -38,6 +38,16 @@ index 000000000..5619a7b33
 +
 +struct snd_pcm_substream;
 +struct snd_pcm_runtime;
++
++/**
++ * struct snd_acoustic_band - audio pass-band limits
++ * @low_hz:  lower cutoff frequency in Hz
++ * @high_hz: upper cutoff frequency in Hz
++ */
++struct snd_acoustic_band {
++	unsigned int low_hz;
++	unsigned int high_hz;
++};
 +
 +#ifdef CONFIG_SND_NATIONSTATE_FILTER
 +
@@ -78,22 +88,67 @@ index 000000000..5619a7b33
 +
 +#endif /* __SOUND_ACOUSTIC_FILTER_H */
 diff --git a/include/sound/pcm.h b/include/sound/pcm.h
-index 76fc33dce..6fa459f9c 100644
+index 76fc33dce..b23681e96 100644
 --- a/include/sound/pcm.h
 +++ b/include/sound/pcm.h
-@@ -441,6 +441,10 @@ struct snd_pcm_runtime {
+@@ -441,6 +441,11 @@ struct snd_pcm_runtime {
  	struct snd_dma_buffer *dma_buffer_p;	/* allocated buffer */
  	unsigned int buffer_changed:1;	/* buffer allocation changed; set only in managed mode */
  
 +#ifdef CONFIG_SND_NATIONSTATE_FILTER
 +	void *acoustic_filter;		/* band-pass hardening filter state */
++	struct snd_acoustic_band acoustic_band; /* band policy override */
 +#endif
 +
  	/* -- audio timestamp config -- */
  	struct snd_pcm_audio_tstamp_config audio_tstamp_config;
  	struct snd_pcm_audio_tstamp_report audio_tstamp_report;
+diff --git a/include/sound/soc-dai.h b/include/sound/soc-dai.h
+index 6a42812bb..4f2ea7237 100644
+--- a/include/sound/soc-dai.h
++++ b/include/sound/soc-dai.h
+@@ -489,6 +489,10 @@ struct snd_soc_dai {
+ 
+ 	/* DAI private data */
+ 	void *priv;
++
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++	struct snd_acoustic_band acoustic_band; /* band policy override */
++#endif
+ };
+ 
+ static inline const struct snd_soc_pcm_stream *
+diff --git a/security/Kconfig.hardening b/security/Kconfig.hardening
+index 86f8768c6..15ec0c324 100644
+--- a/security/Kconfig.hardening
++++ b/security/Kconfig.hardening
+@@ -354,3 +354,24 @@ config GCC_PLUGIN_RANDSTRUCT
+ 	   * https://pax.grsecurity.net/
+ 
+ endmenu
++
++menu "Audio Hardening"
++
++config SECURITY_AUDIO_HARDENING
++	bool "Nationstate level filter pass (acoustic band-pass hardening)"
++	select SND_NATIONSTATE_FILTER
++	help
++	  Enforce a fixed audio pass-band on every PCM stream that flows
++	  through the ALSA core.  All frequencies outside the configured band
++	  are attenuated by a band-pass filter (a high-pass at the lower cutoff
++	  cascaded with a low-pass at the upper cutoff) applied to both
++	  playback and capture.
++
++	  This is intended as hardening against acoustic covert and side
++	  channels (ultrasonic beacons, near-ultrasonic exfiltration,
++	  infrasonic side channels).
++
++	  If unsure, say N.
++
++endmenu
++
 diff --git a/sound/core/Kconfig b/sound/core/Kconfig
-index 4e7bc370f..02153bce5 100644
+index 4e7bc370f..05d01cf97 100644
 --- a/sound/core/Kconfig
 +++ b/sound/core/Kconfig
 @@ -255,6 +255,52 @@ config SND_UTIMER
@@ -134,14 +189,14 @@ index 4e7bc370f..02153bce5 100644
 +config SND_NATIONSTATE_FILTER_LOW_HZ
 +	int "Lower cutoff frequency (Hz)"
 +	depends on SND_NATIONSTATE_FILTER
-+	default 16
++	default 80
 +	help
 +	  Frequencies below this are attenuated (high-pass cutoff).
 +
 +config SND_NATIONSTATE_FILTER_HIGH_HZ
 +	int "Upper cutoff frequency (Hz)"
 +	depends on SND_NATIONSTATE_FILTER
-+	default 10000
++	default 15000
 +	help
 +	  Frequencies above this are attenuated (low-pass cutoff).  The value
 +	  is clamped below the Nyquist frequency of each stream's sample rate.
@@ -163,10 +218,10 @@ index fdd3bb6e8..ea6911a7a 100644
  snd-pcm-$(CONFIG_SND_PCM_IEC958) += pcm_iec958.o
 diff --git a/sound/core/acoustic_filter.c b/sound/core/acoustic_filter.c
 new file mode 100644
-index 000000000..d3cb93401
+index 000000000..4cf06401f
 --- /dev/null
 +++ b/sound/core/acoustic_filter.c
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,314 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Acoustic band-pass hardening filter ("Nationstate level filter pass").
@@ -276,12 +331,18 @@ index 000000000..d3cb93401
 +	return div_s64(coeff_q30 << FILT_FRAC, a0_q30);
 +}
 +
-+static void design_filter(struct acoustic_filter *f, unsigned int rate)
++static void design_filter(struct acoustic_filter *f, struct snd_pcm_substream *substream)
 +{
++	unsigned int rate = substream->runtime->rate;
 +	s64 w0_lo, w0_hi, cos0, sin0, alpha, a0;
 +	s64 b0, b1, b2;
 +	unsigned int low = CONFIG_SND_NATIONSTATE_FILTER_LOW_HZ;
 +	unsigned int high = CONFIG_SND_NATIONSTATE_FILTER_HIGH_HZ;
++
++	if (substream->pcm->acoustic_band.low_hz)
++		low = substream->pcm->acoustic_band.low_hz;
++	if (substream->pcm->acoustic_band.high_hz)
++		high = substream->pcm->acoustic_band.high_hz;
 +
 +	f->rate = rate;
 +
@@ -375,7 +436,7 @@ index 000000000..d3cb93401
 +
 +	if (f && f->channels == channels) {
 +		if (f->rate != runtime->rate)
-+			design_filter(f, runtime->rate);
++			design_filter(f, substream);
 +		return f;
 +	}
 +
@@ -387,7 +448,7 @@ index 000000000..d3cb93401
 +		return NULL;
 +	}
 +	f->channels = channels;
-+	design_filter(f, runtime->rate);
++	design_filter(f, substream);
 +	runtime->acoustic_filter = f;
 +	return f;
 +}
@@ -446,6 +507,21 @@ index 000000000..d3cb93401
 +		n = bytes / bps;
 +		for (i = 0; i < n; i++, p += bps) {
 +			s32 v = load_sample(p, bps);
++
++			v = filter_sample(f, &f->chan[channel], v, smin, smax);
++			store_sample(p, bps, v);
++		}
++	}
++
++	return 0;
++}
++
++void snd_acoustic_filter_free(struct snd_pcm_runtime *runtime)
++{
++	kfree(runtime->acoustic_filter);
++	runtime->acoustic_filter = NULL;
++}
++(p, bps);
 +
 +			v = filter_sample(f, &f->chan[channel], v, smin, smax);
 +			store_sample(p, bps, v);
@@ -593,3 +669,27 @@ index 6debd8e95..39ee1f65f 100644
  	select SND_PCM
  	help
  	  If you don't have a sound card in your computer, you can include a
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index 9b12eedb7..b5a18dbe9 100644
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -2936,6 +2936,19 @@ int soc_new_pcm(struct snd_soc_pcm_runtime *rtd)
+ 	pcm->private_data = rtd;
+ 	pcm->no_device_suspend = true;
+ 
++#ifdef CONFIG_SND_NATIONSTATE_FILTER
++	{
++		struct snd_soc_dai *dai;
++
++		for_each_rtd_dais(rtd, i, dai) {
++			if (dai->acoustic_band.low_hz)
++				pcm->acoustic_band.low_hz = dai->acoustic_band.low_hz;
++			if (dai->acoustic_band.high_hz)
++				pcm->acoustic_band.high_hz = dai->acoustic_band.high_hz;
++		}
++	}
++#endif
++
+ 	if (rtd->dai_link->no_pcm || rtd->dai_link->c2c_params) {
+ 		if (playback)
+ 			pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream->private_data = rtd;
